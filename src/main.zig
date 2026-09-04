@@ -144,8 +144,8 @@ const App = struct {
 
     fn updateMetrics(self: *App, info: r4os.abi.GuiWindowInfo) void {
         const canvas = r4os.gui.Canvas.init(&self.ctx.draw, info);
-        self.w = clampI32(canvas.w, 440, 1600);
-        self.h = clampI32(canvas.h, 300, 1000);
+        self.w = @max(canvas.w, 440);
+        self.h = @max(canvas.h, 300);
     }
 
     fn render(self: *App) void {
@@ -651,12 +651,6 @@ fn appendZ(out: []u8, value: []const u8) void {
     if (count > 0) @memcpy(out[len .. len + count], value[0..count]);
     len += count;
     out[len] = 0;
-}
-
-fn clampI32(value: i32, min_value: i32, max_value: i32) i32 {
-    if (value < min_value) return min_value;
-    if (value > max_value) return max_value;
-    return value;
 }
 
 fn focusIndex(target: FocusTarget) usize {
