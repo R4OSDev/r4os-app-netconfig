@@ -107,7 +107,7 @@ const App = struct {
                         },
                         .mouse_down => self.handleMouseDown(event.x, event.y),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
-                        .key_down => self.handleKey(@intCast(event.key & 0xFF)),
+                        .key_down => self.handleKey(event.key),
                         else => {},
                     }
                 },
@@ -272,7 +272,8 @@ const App = struct {
         if (self.releaseButton(x, y, .cancel, self.cancelRect())) return;
     }
 
-    fn handleKey(self: *App, key: u8) void {
+    fn handleKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (self.dialog_open) {
             if (self.messageDialog().keyAction(key) == .ok) {
                 self.dialog_open = false;
@@ -282,7 +283,7 @@ const App = struct {
         }
         if (self.focusedField()) |field| {
             if (key != r4os.gui.Key.tab and key != r4os.gui.Key.shift_tab and key != r4os.gui.Key.enter and key != r4os.gui.Key.escape) {
-                if (field.handleClipboardKey(&self.ctx.desk, key)) self.render();
+                if (field.handleClipboardCodepoint(&self.ctx.desk, codepoint)) self.render();
                 return;
             }
         }
