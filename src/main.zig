@@ -105,6 +105,12 @@ const App = struct {
                             self.updateMetrics(info);
                             self.render();
                         },
+                        .input_reset, .focus_lost => {
+                            if (self.mouse_capture.target != null) {
+                                self.mouse_capture.clear();
+                                self.render();
+                            }
+                        },
                         .mouse_down => self.handleMouseDown(event.x, event.y),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
                         .key_down => self.handleKey(event.key),
