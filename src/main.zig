@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 const AppApi = struct {
     sys: r4os.r4sys.Context,
@@ -5,14 +6,16 @@ const AppApi = struct {
     draw: r4os.r4draw.Context,
     net: r4os.r4net.Context,
     dev: r4os.r4dev.Context,
+    clock: r4os.rpc_budget.Clock,
 
-    fn init(r4_app: *r4os.App) ?AppApi {
+    fn init(r4_app: *r4os.App2) ?AppApi {
         return .{
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
             .draw = r4_app.drawing() orelse return null,
             .net = r4_app.networkLowLevel() orelse return null,
             .dev = r4_app.devicesLowLevel() orelse return null,
+            .clock = (r4_app.clock() catch return null).read,
         };
     }
 };
@@ -51,7 +54,7 @@ const focus_items = [_]r4os.gui.FocusItem{
     .{},
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
     var app = App{ .ctx = &ctx };
     return app.run();
@@ -60,10 +63,11 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
 const App = struct {
     ctx: *AppApi,
     w: i32 = 440,
-    h: i32 = 300,
+    h: i32 = 332,
     initialized: bool = false,
     should_exit: bool = false,
     snapshot: r4os.abi.NetConfigSnapshot = .{},
+    ipv6: ?r4os.abi.Ipv6InterfaceInfo = null,
     ip: r4os.gui.TextField(16) = .{},
     mask: r4os.gui.TextField(16) = .{},
     gateway: r4os.gui.TextField(16) = .{},
@@ -85,7 +89,7 @@ const App = struct {
 
     fn runHosted(self: *App) i32 {
         _ = self.ctx.desk.guiSetTitle("Network");
-        _ = self.ctx.desk.guiSetMinSize(440, 300);
+        _ = self.ctx.desk.guiSetMinSize(440, 332);
         self.init();
         var info: r4os.abi.GuiWindowInfo = .{};
         _ = self.ctx.desk.guiWindowInfo(&info);
@@ -100,7 +104,7 @@ const App = struct {
                     const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
                     switch (kind) {
                         .close => return 0,
-                        .resize => {
+                        .resize, .font_changed => {
                             _ = self.ctx.desk.guiWindowInfo(&info);
                             self.updateMetrics(info);
                             self.render();
@@ -149,13 +153,33 @@ const App = struct {
         } else {
             self.dns.clear();
         }
+        self.refreshFamily();
         self.setStatus("Ready.");
+    }
+
+    fn refreshFamily(self: *App) void {
+        self.ipv6 = null;
+        var budget = r4os.rpc_budget.Budget.fromTimeout(self.ctx.clock, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 500_000_000 }) catch return;
+        for (0..self.snapshot.adapter_count) |index| {
+            _ = budget.remainingTicks() catch {
+                self.ipv6 = null;
+                return;
+            };
+            var client: r4os.network_family.Ipv6 = undefined;
+            if (r4os.network_family.Ipv6.open(self.ctx.dev, @intCast(index), &client) != 0) continue;
+            if (!std.mem.eql(u8, &client.info.link.mac, &self.snapshot.mac)) continue;
+            if (self.ipv6 != null) {
+                self.ipv6 = null;
+                return;
+            }
+            self.ipv6 = client.info;
+        }
     }
 
     fn updateMetrics(self: *App, info: r4os.abi.GuiWindowInfo) void {
         const canvas = r4os.gui.Canvas.init(&self.ctx.draw, info);
         self.w = @max(canvas.w, 440);
-        self.h = @max(canvas.h, 300);
+        self.h = @max(canvas.h, 332);
     }
 
     fn render(self: *App) void {
@@ -210,6 +234,17 @@ const App = struct {
         setZ(line[0..], "Status: ");
         appendZ(line[0..], spanZ(self.snapshot.last_error[0..]));
         _ = canvas.label(.{ .rect = .{ .x = 24, .y = 70, .w = self.w - 48, .h = 16 }, .text = spanZ(line[0..]), .fg = black, .bg = app_bg }, scratch);
+        if (self.ipv6) |info| {
+            var address: [80]u8 = undefined;
+            const selected = if (info.preferred.family == 6) info.preferred else info.link_local;
+            const text = r4os.network_family.addressText(&address, selected) catch "unknown";
+            const address_line = std.fmt.bufPrint(&line, "IPv6 ({d}) {s}", .{ info.link.interface_id, text }) catch "IPv6 address unknown";
+            _ = canvas.label(.{ .rect = .{ .x = 24, .y = 88, .w = self.w - 48, .h = 16 }, .text = address_line, .fg = black, .bg = app_bg }, scratch);
+            const capability_line = std.fmt.bufPrint(&line, "IPv6 capabilities {d}, provider {d}", .{ info.capabilities, info.link.provider }) catch "IPv6 capabilities unknown";
+            _ = canvas.label(.{ .rect = .{ .x = 24, .y = 106, .w = self.w - 48, .h = 16 }, .text = capability_line, .fg = black, .bg = app_bg }, scratch);
+        } else {
+            _ = canvas.label(.{ .rect = .{ .x = 24, .y = 88, .w = self.w - 48, .h = 16 }, .text = "IPv6 provider/address unknown", .fg = black, .bg = app_bg }, scratch);
+        }
     }
 
     fn drawIpv4Box(self: *App, canvas: r4os.gui.Canvas, scratch: []u8) void {
@@ -386,7 +421,19 @@ const App = struct {
             self.setStatus("Test could not build ICMP packet.");
             return;
         };
+        var budget = r4os.rpc_budget.Budget.fromTimeout(self.ctx.clock, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 1_000_000_000 }) catch {
+            self.setStatus("Test clock unavailable.");
+            return;
+        };
+        _ = budget.remainingTicks() catch {
+            self.setStatus("Test budget unavailable.");
+            return;
+        };
         const result = self.ctx.net.netIpv4Send(gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3], ICMP_PROTOCOL, payload);
+        _ = budget.remainingTicks() catch {
+            self.setStatus("Test completion crossed its clock budget.");
+            return;
+        };
         if (result == r4os.abi.net_tx_ok) {
             self.setStatus("Test: ICMP echo sent to the gateway.");
             self.setDialog(.info, "Network test", "ICMP echo was sent. Test the reply with PING.");
@@ -468,11 +515,11 @@ const App = struct {
     }
 
     fn adapterRect(self: *const App) r4os.gui.Rect {
-        return .{ .x = 12, .y = 10, .w = self.w - 24, .h = 84 };
+        return .{ .x = 12, .y = 10, .w = self.w - 24, .h = 116 };
     }
 
     fn ipv4Rect(self: *const App) r4os.gui.Rect {
-        return .{ .x = 12, .y = 104, .w = self.w - 24, .h = @max(126, self.h - 180) };
+        return .{ .x = 12, .y = 136, .w = self.w - 24, .h = @max(144, self.h - 188) };
     }
 
     fn fieldX(self: *const App) i32 {
@@ -485,19 +532,19 @@ const App = struct {
     }
 
     fn ipRect(self: *const App) r4os.gui.Rect {
-        return .{ .x = self.fieldX(), .y = 132, .w = self.fieldW(), .h = 22 };
+        return .{ .x = self.fieldX(), .y = 164, .w = self.fieldW(), .h = 22 };
     }
 
     fn maskRect(self: *const App) r4os.gui.Rect {
-        return .{ .x = self.fieldX(), .y = 160, .w = self.fieldW(), .h = 22 };
+        return .{ .x = self.fieldX(), .y = 192, .w = self.fieldW(), .h = 22 };
     }
 
     fn gatewayRect(self: *const App) r4os.gui.Rect {
-        return .{ .x = self.fieldX(), .y = 188, .w = self.fieldW(), .h = 22 };
+        return .{ .x = self.fieldX(), .y = 220, .w = self.fieldW(), .h = 22 };
     }
 
     fn dnsRect(self: *const App) r4os.gui.Rect {
-        return .{ .x = self.fieldX(), .y = 216, .w = self.fieldW(), .h = 22 };
+        return .{ .x = self.fieldX(), .y = 248, .w = self.fieldW(), .h = 22 };
     }
 
     fn buttonY(self: *const App) i32 {
@@ -534,31 +581,9 @@ const App = struct {
 };
 
 fn parseIpv4(value: []const u8) ?[4]u8 {
-    var out: [4]u8 = .{0} ** 4;
-    var part: usize = 0;
-    var accum: u16 = 0;
-    var digits: usize = 0;
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const ch = value[index];
-        if (ch >= '0' and ch <= '9') {
-            accum = accum * 10 + @as(u16, ch - '0');
-            if (accum > 255) return null;
-            digits += 1;
-            if (digits > 3) return null;
-        } else if (ch == '.') {
-            if (digits == 0 or part >= 3) return null;
-            out[part] = @intCast(accum);
-            part += 1;
-            accum = 0;
-            digits = 0;
-        } else {
-            return null;
-        }
-    }
-    if (digits == 0 or part != 3) return null;
-    out[part] = @intCast(accum);
-    return out;
+    var parts = std.mem.splitScalar(u8, value, '.');
+    while (parts.next()) |part| if (part.len > 3) return null;
+    return r4os.network_family.parseIpv4(value);
 }
 
 fn validNetmask(mask: [4]u8) bool {
@@ -590,14 +615,9 @@ fn buildEchoRequest(out: []u8, ident: u16, seq: u16) ?[]const u8 {
 }
 
 fn checksum(data: []const u8) u16 {
-    var sum: u32 = 0;
-    var index: usize = 0;
-    while (index + 1 < data.len) : (index += 2) {
-        sum += (@as(u32, data[index]) << 8) | data[index + 1];
-    }
-    if (index < data.len) sum += @as(u32, data[index]) << 8;
-    while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
-    return @intCast(~sum & 0xFFFF);
+    var state: r4os.internet_checksum.Checksum16 = .{};
+    state.add(data) catch unreachable;
+    return state.finish() catch unreachable;
 }
 
 fn writeBe16(buf: []u8, offset: usize, value: u16) void {
@@ -671,4 +691,23 @@ fn focusIndex(target: FocusTarget) usize {
 fn focusedTarget(index: usize) FocusTarget {
     if (index >= focus_items.len) return .ip;
     return @enumFromInt(index);
+}
+
+test "migration network configuration validates the entire request before mutation" {
+    var app: App = .{ .ctx = undefined };
+    app.ip.set("010.000.002.015");
+    app.mask.set("255.255.255.0");
+    app.gateway.set("10.0.2.2");
+    app.dns.set("10.0.2.3");
+    var request: r4os.abi.NetConfigRequest = .{};
+    try std.testing.expect(app.buildRequest(&request));
+    try std.testing.expectEqualStrings("010.000.002.015", spanZ(&request.local_ip));
+    const before = request;
+    app.mask.set("255.0.255.0");
+    try std.testing.expect(!app.buildRequest(&request));
+    try std.testing.expectEqualDeep(before, request);
+    app.mask.set("255.255.255.0");
+    app.dns.set("fe80::1%17");
+    try std.testing.expect(!app.buildRequest(&request));
+    try std.testing.expectEqualDeep(before, request);
 }
